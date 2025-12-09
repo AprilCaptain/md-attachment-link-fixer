@@ -1,0 +1,29 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Build outputs
+build/
+dist/
+*.spec
+
+# Runtime temp files (from md_link_fixer)
+attachment_rename_map.json
+file_path_index.json
+
+# OS / Editor junk
+.DS_Store
+Thumbs.db
+ehthumbs.db
+
+# IDE & editor configs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Virtual environments (如果以后加虚拟环境)
+venv/
+.env/
+.venv/
