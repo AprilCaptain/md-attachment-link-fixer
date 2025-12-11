@@ -65,6 +65,15 @@ your-notes/
 ### 2. 双击运行（或使用命令）
 ```yaml
 python md_link_fixer.py
+# 仅重命名图片是默认行为，可用 --rename-types 设置分类（image/video/audio/office/other 或 all）
+python md_link_fixer.py --rename-types image office
+python md_link_fixer.py --rename-types other          # 仅重命名非 Markdown 的其它文件
+python md_link_fixer.py --rename-types all            # 全部非 Markdown
+python md_link_fixer.py --data-dir D:\data\md-fixer   # 固化数据输出目录
+
+# 启动界面模式
+python md_link_fixer.py --ui
+# UI 首次运行会要求填写文档项目路径与数据存放路径，并可为项目设置名称和分类。
 ```
 
 ### 3. 等待完成  
@@ -79,7 +88,10 @@ python md_link_fixer.py
 ## 🛠 打包为 EXE（可选）
 
 ```shell
-pyinstaller --onefile --console --icon=icon.ico md_link_fixer.py
+# 命令行版（console）
+pyinstaller --onefile --console --icon=assets/app.ico md_link_fixer.py
+# 图形界面版（windowed）
+pyinstaller --onefile --windowed --icon=assets/app.ico md_link_fixer_ui.py
 ```
 
 ---
@@ -87,7 +99,7 @@ pyinstaller --onefile --console --icon=icon.ico md_link_fixer.py
 ## 🛠 打包为 macOS APP（可选）
 
 ```shell
-pyinstaller --onefile --windowed --icon=icon.icns md_link_fixer.py
+pyinstaller --onefile --windowed --icon=icon.icns md_link_fixer_ui.py
 ```
 
 ---
@@ -95,6 +107,8 @@ pyinstaller --onefile --windowed --icon=icon.icns md_link_fixer.py
 ## ⚠ 注意事项 Notes
 
 - 本工具不会修改 `.md` 文件的文件名。
+- 重命名分类仅作用于重命名步骤，Markdown 引用修复仍会扫描所有附件；支持 image / video / audio / office / other / all。
+- 运行后会输出重复命名文件的 Markdown 表格报告，并在命令行模式下提示回车结束。
 - 若 Markdown 文件名模糊匹配结果多于 1 个，为避免错误，将不会自动修复。
 - 请确保你的 Markdown 文件名尽量具有唯一性。
 
