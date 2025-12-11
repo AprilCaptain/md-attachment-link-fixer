@@ -67,6 +67,7 @@ CATEGORY_LABELS = {
     "all": "全部",
 }
 CATEGORY_LABEL_TO_KEY = {v: k for k, v in CATEGORY_LABELS.items()}
+CATEGORY_ORDER = ["image", "video", "audio", "office", "other"]
 
 # ---------- 基础工具 ----------
 
@@ -611,7 +612,7 @@ def launch_ui(default_root: Optional[str] = None):
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
     PROJECT_CATEGORIES = list(RENAMING_CATEGORIES.keys()) + ["other"]
-    CATEGORY_OPTIONS = [CATEGORY_LABELS[c] for c in PROJECT_CATEGORIES] + [CATEGORY_LABELS["all"]]
+    CATEGORY_CHOICES = [(c, CATEGORY_LABELS[c]) for c in PROJECT_CATEGORIES] + [("all", CATEGORY_LABELS["all"])]
     projects, settings = load_projects_config()
     app = tk.Tk()
     app.title("Markdown 附件重命名 & 路径修复工具")
@@ -706,6 +707,73 @@ def launch_ui(default_root: Optional[str] = None):
             msg = self.format(record)
             append_log(msg)
 
+    def normalize_categories(selected_types: Optional[List[str]]):
+        if not selected_types:
+            return [DEFAULT_RENAME_CATEGORY]
+        if "all" in selected_types:
+            return ["all"]
+        ordered = [t for t in CATEGORY_ORDER if t in selected_types]
+        extras = [t for t in selected_types if t not in ordered and t in {"other"}]
+        normalized = ordered + extras
+        return normalized or [DEFAULT_RENAME_CATEGORY]
+
+    def category_labels(rename_types: Optional[List[str]]):
+        if not rename_types:
+            return [CATEGORY_LABELS[DEFAULT_RENAME_CATEGORY]]
+        if "all" in rename_types:
+            return [CATEGORY_LABELS["all"]]
+        labels = [CATEGORY_LABELS[t] for t in CATEGORY_ORDER if t in rename_types]
+        return labels or [CATEGORY_LABELS[DEFAULT_RENAME_CATEGORY]]
+
+    def category_label_from_types(rename_types: Optional[List[str]]):
+        return "、".join(category_labels(rename_types))
+
+    class MultiSelectDropdown(ttk.Menubutton):
+        def __init__(self, parent, options, initial_keys=None, command=None, **kwargs):
+            super().__init__(parent, **kwargs)
+            self.options = options
+            self.command = command
+            self.display_var = tk.StringVar()
+            self.vars = {}
+            self.menu = tk.Menu(self, tearoff=0)
+            selected = set(initial_keys or [])
+            select_all = "all" in selected
+            for key, label in self.options:
+                init_val = (key == "all" and select_all) or (not select_all and key in selected)
+                var = tk.BooleanVar(value=init_val)
+                self.vars[key] = var
+                self.menu.add_checkbutton(label=label, variable=var, command=lambda k=key: self._on_toggle(k))
+            self.configure(textvariable=self.display_var, menu=self.menu, direction="below")
+            self._update_display()
+
+        def _on_toggle(self, key: str):
+            if key == "all":
+                for k, var in self.vars.items():
+                    var.set(k == "all")
+            else:
+                if "all" in self.vars:
+                    self.vars["all"].set(False)
+            self._update_display()
+            if self.command:
+                self.command(self.get_selected())
+
+        def _update_display(self):
+            self.display_var.set(category_label_from_types(self.get_selected()))
+
+        def get_selected(self) -> List[str]:
+            selected = [k for k, var in self.vars.items() if var.get()]
+            return normalize_categories(selected)
+
+        def set_selected(self, keys: List[str]):
+            normalized = normalize_categories(keys)
+            select_all = "all" in normalized
+            for key, var in self.vars.items():
+                if select_all:
+                    var.set(key == "all")
+                else:
+                    var.set(key in normalized)
+            self._update_display()
+
     state = {"projects": projects, "selected": 0, "settings": settings or {}}
     state["settings"].setdefault("data_dir", "")
     running = {"flag": False}
@@ -727,11 +795,11 @@ def launch_ui(default_root: Optional[str] = None):
         else:
             state["selected"] = max(0, min(state["selected"], len(state["projects"]) - 1))
 
-    def add_project(root_val: str, name_val: str):
+    def add_project(root_val: str, name_val: str, rename_types: Optional[List[str]] = None):
         project = {
             "name": name_val.strip() or Path(root_val).name,
             "root": root_val,
-            "rename_types": [DEFAULT_RENAME_CATEGORY],
+            "rename_types": normalize_categories(rename_types or [DEFAULT_RENAME_CATEGORY]),
         }
         state["projects"].append(project)
         state["selected"] = len(state["projects"]) - 1
@@ -753,11 +821,11 @@ def launch_ui(default_root: Optional[str] = None):
         ttk.Label(frame, text="首次使用 - 系统设置与项目", font=("Segoe UI", 12, "bold")).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
         ttk.Label(frame, text="数据存储位置（系统设置，必填）：").grid(row=1, column=0, sticky="w", pady=(8, 2))
         ttk.Entry(frame, textvariable=data_path, width=60).grid(row=1, column=1, sticky="we", padx=(4, 4))
-        ttk.Button(frame, text="选择…", command=lambda: data_path.set(filedialog.askdirectory(initialdir=data_path.get() or get_app_root()) or data_path.get())).grid(row=1, column=2, sticky="e")
+        ttk.Button(frame, text="...", width=3, command=lambda: data_path.set(filedialog.askdirectory(initialdir=data_path.get() or get_app_root()) or data_path.get())).grid(row=1, column=2, sticky="e")
 
         ttk.Label(frame, text="文档项目位置（必填）：").grid(row=2, column=0, sticky="w", pady=(8, 2))
         ttk.Entry(frame, textvariable=root_path, width=60).grid(row=2, column=1, sticky="we", padx=(4, 4))
-        ttk.Button(frame, text="选择…", command=lambda: root_path.set(filedialog.askdirectory(initialdir=root_path.get() or get_app_root()) or root_path.get())).grid(row=2, column=2, sticky="e")
+        ttk.Button(frame, text="...", width=3, command=lambda: root_path.set(filedialog.askdirectory(initialdir=root_path.get() or get_app_root()) or root_path.get())).grid(row=2, column=2, sticky="e")
 
         ttk.Label(frame, text="自定义名称（可选）：").grid(row=3, column=0, sticky="w", pady=(8, 2))
         ttk.Entry(frame, textvariable=name_var, width=60).grid(row=3, column=1, sticky="we", padx=(4, 4))
@@ -819,7 +887,7 @@ def launch_ui(default_root: Optional[str] = None):
         canvas = tk.Canvas(left, bg=colors["bg"], highlightthickness=0, height=360)
         scrollbar = ttk.Scrollbar(left, orient="vertical", command=canvas.yview)
         list_frame = tk.Frame(canvas, bg=colors["bg"])
-        canvas.create_window((0, 0), window=list_frame, anchor="nw")
+        list_window = canvas.create_window((0, 0), window=list_frame, anchor="nw")
         canvas.configure(yscrollcommand=scrollbar.set)
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
@@ -827,6 +895,7 @@ def launch_ui(default_root: Optional[str] = None):
         def refresh_scroll(event=None):
             canvas.configure(scrollregion=canvas.bbox("all"))
         list_frame.bind("<Configure>", refresh_scroll)
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(list_window, width=e.width))
 
         # Detail + log
         right = tk.Frame(content, bg=colors["bg"], padx=10, pady=6)
@@ -835,19 +904,9 @@ def launch_ui(default_root: Optional[str] = None):
 
         project_name = tk.StringVar()
         root_path = tk.StringVar()
-        category_var = tk.StringVar(value=CATEGORY_LABELS[DEFAULT_RENAME_CATEGORY])
+        category_var = tk.StringVar(value=category_label_from_types([DEFAULT_RENAME_CATEGORY]))
         status_var = tk.StringVar(value="等待运行...")
         state["summary"] = None
-
-        def category_label_from_types(rename_types: Optional[List[str]]):
-            if rename_types and "all" in rename_types:
-                return CATEGORY_LABELS["all"]
-            key = rename_types[0] if rename_types else DEFAULT_RENAME_CATEGORY
-            return CATEGORY_LABELS.get(key, CATEGORY_LABELS[DEFAULT_RENAME_CATEGORY])
-
-        def normalize_category_label(label: str):
-            key = CATEGORY_LABEL_TO_KEY.get(label)
-            return key or DEFAULT_RENAME_CATEGORY
 
         def get_active_data_dir():
             data_dir = (state["settings"].get("data_dir") or "").strip()
@@ -868,7 +927,7 @@ def launch_ui(default_root: Optional[str] = None):
             root_path.set(proj["root"])
             rename_types = proj.get("rename_types", [DEFAULT_RENAME_CATEGORY])
             category_var.set(category_label_from_types(rename_types))
-            render_tags(category_var.get())
+            render_tags(category_labels(rename_types))
 
         def make_link_label(parent, text, target_path):
             lbl = tk.Label(parent, text=text, bg=colors["card"], fg=colors["accent"], cursor="hand2")
@@ -934,7 +993,7 @@ def launch_ui(default_root: Optional[str] = None):
                 persist_projects()
                 dialog.destroy()
 
-            ttk.Button(dialog, text="选择…", command=choose_dir).grid(row=0, column=2, sticky="e")
+            ttk.Button(dialog, text="...", width=3, command=choose_dir).grid(row=0, column=2, sticky="e")
             btns = ttk.Frame(dialog)
             btns.grid(row=1, column=0, columnspan=3, sticky="e", pady=(10, 4))
             ttk.Button(btns, text="保存", command=save_settings).pack(side="left", padx=4)
@@ -952,7 +1011,7 @@ def launch_ui(default_root: Optional[str] = None):
 
             ttk.Label(dialog, text="文档项目位置：").grid(row=0, column=0, sticky="w", pady=(8, 2))
             ttk.Entry(dialog, textvariable=root_var, width=50).grid(row=0, column=1, sticky="we", padx=(4, 4))
-            ttk.Button(dialog, text="选择…", command=lambda: root_var.set(filedialog.askdirectory(initialdir=root_var.get() or get_app_root()) or root_var.get())).grid(row=0, column=2, sticky="e")
+            ttk.Button(dialog, text="...", width=3, command=lambda: root_var.set(filedialog.askdirectory(initialdir=root_var.get() or get_app_root()) or root_var.get())).grid(row=0, column=2, sticky="e")
 
             ttk.Label(dialog, text="自定义名称（可选）：").grid(row=1, column=0, sticky="w", pady=(8, 2))
             ttk.Entry(dialog, textvariable=name_var, width=50).grid(row=1, column=1, sticky="we", padx=(4, 4))
@@ -1053,7 +1112,7 @@ def launch_ui(default_root: Optional[str] = None):
             dialog.grab_set()
 
             name_var = tk.StringVar(value=proj.get("name") or Path(proj.get("root", "")).name)
-            category_var_dlg = tk.StringVar(value=category_label_from_types(proj.get("rename_types", [DEFAULT_RENAME_CATEGORY])))
+            initial_types = proj.get("rename_types", [DEFAULT_RENAME_CATEGORY])
 
             ttk.Label(dialog, text="名称：").grid(row=0, column=0, sticky="w", pady=(8, 2))
             ttk.Entry(dialog, textvariable=name_var, width=50).grid(row=0, column=1, sticky="we", padx=(4, 4))
@@ -1062,15 +1121,14 @@ def launch_ui(default_root: Optional[str] = None):
             ttk.Label(dialog, text=proj.get("root", ""), foreground=colors["muted"]).grid(row=1, column=1, sticky="w")
 
             ttk.Label(dialog, text="重命名分类：").grid(row=2, column=0, sticky="w", pady=(8, 2))
-            dlg_combo = ttk.Combobox(dialog, state="readonly", values=CATEGORY_OPTIONS, textvariable=category_var_dlg)
-            dlg_combo.grid(row=2, column=1, sticky="we", padx=(4, 4))
+            category_dropdown = MultiSelectDropdown(dialog, CATEGORY_CHOICES, initial_keys=initial_types)
+            category_dropdown.grid(row=2, column=1, sticky="we", padx=(4, 4))
 
             def confirm_update():
                 if not messagebox.askyesno("确认修改", "确认修改名称和分类吗？"):
                     return
                 proj["name"] = name_var.get().strip() or Path(proj.get("root", "")).name
-                cat_key = normalize_category_label(category_var_dlg.get())
-                proj["rename_types"] = ["all"] if cat_key == "all" else [cat_key]
+                proj["rename_types"] = category_dropdown.get_selected()
                 proj.pop("data_dir", None)
                 persist_projects()
                 set_fields_from_project(idx)
@@ -1183,13 +1241,14 @@ def launch_ui(default_root: Optional[str] = None):
         tags_frame = tk.Frame(right, bg=colors["bg"])
         tags_frame.grid(row=3, column=1, columnspan=2, sticky="w", padx=(4, 4))
 
-        def render_tags(label_text: str):
+        def render_tags(label_texts: List[str]):
             for child in tags_frame.winfo_children():
                 child.destroy()
-            tag = tk.Label(tags_frame, text=label_text, bg=colors["selected"], fg=colors["text"], padx=6, pady=2, bd=0, relief="flat")
-            tag.pack(side="left", padx=(0, 6))
+            for txt in label_texts:
+                tag = tk.Label(tags_frame, text=txt, bg=colors["selected"], fg=colors["text"], padx=6, pady=2, bd=0, relief="flat")
+                tag.pack(side="left", padx=(0, 6))
 
-        render_tags(category_var.get())
+        render_tags(category_labels([DEFAULT_RENAME_CATEGORY]))
 
         ttk.Label(right, textvariable=status_var, foreground=colors["accent"]).grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 2))
 
@@ -1230,13 +1289,15 @@ def launch_ui(default_root: Optional[str] = None):
 
         def render_table(parent, title: str, columns, rows):
             section = tk.Frame(parent, bg=colors["bg"], pady=4)
-            section.pack(fill="both", expand=True, pady=4)
+            section.pack(fill="x", expand=True, pady=4)
             tk.Label(section, text=title, bg=colors["bg"], fg=colors["text"], font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(0, 2))
-            tree = ttk.Treeview(section, columns=columns, show="headings", height=min(8, len(rows) + 1))
-            for col, width in columns:
-                tree.heading(col, text=col)
-                tree.column(col, width=width, anchor="w")
-            for row in rows:
+            col_ids = [f"c{i}" for i in range(len(columns))]
+            tree = ttk.Treeview(section, columns=col_ids, show="headings", height=max(3, min(8, len(rows) + 1)))
+            for col_id, (title_txt, width) in zip(col_ids, columns):
+                tree.heading(col_id, text=title_txt)
+                tree.column(col_id, width=width, anchor="w")
+            display_rows = rows or [["暂无数据"] + [""] * (len(columns) - 1)]
+            for row in display_rows:
                 tree.insert("", "end", values=row)
             vsb = ttk.Scrollbar(section, orient="vertical", command=tree.yview)
             tree.configure(yscrollcommand=vsb.set)
@@ -1249,6 +1310,17 @@ def launch_ui(default_root: Optional[str] = None):
             if not summary:
                 tk.Label(summary_frame, text="运行结果将以表格展示", bg=colors["bg"], fg=colors["muted"]).pack(anchor="w", padx=4, pady=4)
                 return
+
+            meta = tk.Frame(summary_frame, bg=colors["bg"])
+            meta.pack(fill="x", padx=4, pady=(4, 2))
+            meta_items = [
+                f"工作目录：{summary.get('root', '')}",
+                f"重命名分类：{summary.get('rename_categories', '')}",
+                f"重命名 {summary.get('renamed_files', 0)}/{summary.get('rename_candidates', 0)}",
+                f"Markdown 修复 {summary.get('markdown_fixed', 0)}，替换 {summary.get('replacements', 0)} 处",
+            ]
+            for item in meta_items:
+                tk.Label(meta, text=item, bg=colors["bg"], fg=colors["text"]).pack(anchor="w")
 
             rename_rows = [
                 ("重命名", item["old"], item["new"], item.get("path", ""))
