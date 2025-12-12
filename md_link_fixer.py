@@ -52,7 +52,6 @@ RENAMING_CATEGORIES = {
 }
 
 DEFAULT_RENAME_CATEGORY = "image"
-ALL_KNOWN_EXTS = set().union(*RENAMING_CATEGORIES.values())
 
 CONFIG_DIR = os.path.join(Path.home(), ".md_link_fixer")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "projects.json")
@@ -63,11 +62,28 @@ CATEGORY_LABELS = {
     "video": "视频",
     "audio": "音频",
     "office": "办公",
-    "other": "其他",
     "all": "全部",
 }
-CATEGORY_LABEL_TO_KEY = {v: k for k, v in CATEGORY_LABELS.items()}
-CATEGORY_ORDER = ["image", "video", "audio", "office", "other"]
+CATEGORY_ORDER = ["image", "video", "audio", "office"]
+
+def normalize_categories(selected_types: Optional[List[str]]):
+    if not selected_types:
+        return [DEFAULT_RENAME_CATEGORY]
+    lowered = [t.lower() for t in selected_types if t]
+    filtered = [t for t in lowered if t in RENAMING_CATEGORIES or t == "all"]
+    if "all" in filtered:
+        return ["all"]
+    ordered = [t for t in CATEGORY_ORDER if t in filtered]
+    return ordered or [DEFAULT_RENAME_CATEGORY]
+
+def category_labels(rename_types: Optional[List[str]]):
+    normalized = normalize_categories(rename_types)
+    if "all" in normalized:
+        return [CATEGORY_LABELS["all"]]
+    return [CATEGORY_LABELS[t] for t in CATEGORY_ORDER if t in normalized]
+
+def category_label_from_types(rename_types: Optional[List[str]]):
+    return "、".join(category_labels(rename_types))
 
 # ---------- 基础工具 ----------
 
@@ -75,6 +91,15 @@ def get_app_root() -> str:
     if getattr(sys, "frozen", False):
         return os.path.dirname(os.path.abspath(sys.executable))
     return os.path.dirname(os.path.abspath(__file__))
+
+
+def normalize_display_path(path: str) -> str:
+    if not path:
+        return path
+    try:
+        return os.path.normpath(path)
+    except Exception:
+        return path
 
 
 def setup_logger(verbose=False, extra_handlers=None):
@@ -155,14 +180,13 @@ def generate_unique_filename(target_dir: str, ext: str, used: set) -> str:
 # ---------- 扫描 + 重命名附件 ----------
 
 def resolve_allowed_extensions(categories: Optional[List[str]]):
-    if not categories:
-        categories = [DEFAULT_RENAME_CATEGORY]
-
-    normalized = [c.lower() for c in categories]
+    normalized = normalize_categories(categories)
     allow_all = "all" in normalized
-    allow_other = "other" in normalized
 
-    unknown = [c for c in normalized if c not in RENAMING_CATEGORIES and c not in {"all", "other"}]
+    unknown = [
+        c for c in (categories or [])
+        if c and c.lower() not in RENAMING_CATEGORIES and c.lower() not in {"all", "other"}
+    ]
     if unknown:
         raise ValueError(f"Unknown rename categories: {', '.join(unknown)}")
 
@@ -171,11 +195,11 @@ def resolve_allowed_extensions(categories: Optional[List[str]]):
         if cat in RENAMING_CATEGORIES:
             allowed |= RENAMING_CATEGORIES[cat]
 
-    label = ", ".join(normalized)
-    return allowed, allow_other, allow_all, label
+    label = category_label_from_types(normalized)
+    return allowed, allow_all, normalized, label
 
 
-def walk_attachments(root_dir: str, self_exec: str, allowed_exts: Optional[set], allow_other: bool, allow_all: bool):
+def walk_attachments(root_dir: str, self_exec: str, allowed_exts: Optional[set], allow_all: bool):
     result = []
 
     for dirpath, dirnames, filenames in os.walk(root_dir):
@@ -201,21 +225,16 @@ def walk_attachments(root_dir: str, self_exec: str, allowed_exts: Optional[set],
                 continue
             _, ext = os.path.splitext(filename)
             ext = ext.lower()
-            if not allow_all:
-                if allowed_exts is not None and ext in allowed_exts:
-                    pass
-                elif allow_other and ext not in ALL_KNOWN_EXTS:
-                    pass
-                else:
-                    continue
+            if not allow_all and allowed_exts is not None and ext not in allowed_exts:
+                continue
 
             result.append((abs_path, rel_path))
 
     return result
 
 
-def rename_attachments(root_dir: str, self_exec: str, allowed_exts: Optional[set], allow_other: bool, allow_all: bool):
-    attachments = walk_attachments(root_dir, self_exec, allowed_exts, allow_other, allow_all)
+def rename_attachments(root_dir: str, self_exec: str, allowed_exts: Optional[set], allow_all: bool):
+    attachments = walk_attachments(root_dir, self_exec, allowed_exts, allow_all)
     logging.info(f"检测到未规范附件：{len(attachments)} 个")
 
     mapping = {}
@@ -319,6 +338,7 @@ def detect_duplicate_filenames(index: Dict[str, List[str]]):
 
 
 def write_reports(data_dir: str, summary: Dict):
+    data_dir = normalize_display_path(data_dir)
     os.makedirs(data_dir, exist_ok=True)
     json_path = os.path.join(data_dir, "latest_summary.json")
     md_path = os.path.join(data_dir, "latest_report.md")
@@ -333,10 +353,24 @@ def write_reports(data_dir: str, summary: Dict):
         f"- 重命名分类：{summary['rename_categories']}",
         f"- 重命名候选：{summary['rename_candidates']}，实际重命名：{summary['renamed_files']}",
         f"- Markdown 修复：{summary['markdown_fixed']}，替换次数：{summary['replacements']}",
+        f"- 失效引用：{summary.get('invalid_reference_count', 0)}",
         "",
         "## 重复命名文件",
         summary["duplicate_table"],
     ]
+
+    invalid_refs = summary.get("invalid_references") or []
+    if invalid_refs:
+        lines.extend([
+            "",
+            "## 失效引用",
+            "",
+            "| Markdown | 引用路径 |",
+            "| --- | --- |",
+        ])
+        for item in invalid_refs:
+            lines.append(f"| `{item.get('file', '')}` | {item.get('link', '')} |")
+
     with open(md_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
@@ -397,8 +431,9 @@ def transform_path(
     url = url.strip()
 
     if not url or is_external_or_absolute(url):
-        return url
+        return url, True
 
+    abs_candidate = None
     # 映射修复
     try:
         abs_candidate = os.path.normpath(os.path.join(md_dir, url))
@@ -410,7 +445,7 @@ def transform_path(
         new_rel = mapping[rel_from_root]
         new_abs = os.path.join(root_dir, new_rel.replace("/", os.sep))
         if os.path.exists(new_abs):
-            return os.path.relpath(new_abs, md_dir).replace(os.sep, "/")
+            return os.path.relpath(new_abs, md_dir).replace(os.sep, "/"), True
 
     filename = os.path.basename(url)
 
@@ -423,9 +458,12 @@ def transform_path(
     if found_rel:
         new_abs = os.path.join(root_dir, found_rel.replace("/", os.sep))
         if os.path.exists(new_abs):
-            return os.path.relpath(new_abs, md_dir).replace(os.sep, "/")
+            return os.path.relpath(new_abs, md_dir).replace(os.sep, "/"), True
 
-    return url
+    if abs_candidate and os.path.exists(abs_candidate):
+        return url, True
+
+    return url, False
 
 
 def replace_in_markdown(
@@ -438,6 +476,7 @@ def replace_in_markdown(
 ):
     md_dir = os.path.dirname(md_abs_path)
     replaced_count = 0
+    broken_links: List[str] = []
 
     def md_repl(match):
         nonlocal replaced_count
@@ -448,10 +487,12 @@ def replace_in_markdown(
             return match.group(0)
 
         pre, url, angle, tail = m.groups()
-        new_url = transform_path(url, md_dir, root_dir, mapping, markdown_paths, attachment_paths)
+        new_url, resolved = transform_path(url, md_dir, root_dir, mapping, markdown_paths, attachment_paths)
 
         if new_url != url:
             replaced_count += 1
+        if not resolved:
+            broken_links.append(url)
 
         return f"{prefix}{pre}{new_url}{angle}{tail}{suffix}"
 
@@ -459,17 +500,19 @@ def replace_in_markdown(
         nonlocal replaced_count
         prefix, url, suffix = match.groups()
 
-        new_url = transform_path(url, md_dir, root_dir, mapping, markdown_paths, attachment_paths)
+        new_url, resolved = transform_path(url, md_dir, root_dir, mapping, markdown_paths, attachment_paths)
 
         if new_url != url:
             replaced_count += 1
+        if not resolved:
+            broken_links.append(url)
 
         return f"{prefix}{new_url}{suffix}"
 
     content = MD_LINK_PATTERN.sub(md_repl, content)
     content = HTML_SRC_PATTERN.sub(html_repl, content)
 
-    return content, replaced_count
+    return content, replaced_count, broken_links
 
 
 def process_markdown_files(root_dir: str, index: Dict[str, List[str]], mapping: Dict[str, str]):
@@ -479,6 +522,7 @@ def process_markdown_files(root_dir: str, index: Dict[str, List[str]], mapping: 
     total_files = 0
     total_replacements = 0
     changed_files = []
+    invalid_references = []
 
     for rel_md in markdown_paths:
         abs_md = os.path.join(root_dir, rel_md.replace("/", os.sep))
@@ -491,9 +535,12 @@ def process_markdown_files(root_dir: str, index: Dict[str, List[str]], mapping: 
             logging.error(f"读取失败：{rel_md}，{e}")
             continue
 
-        new_content, count = replace_in_markdown(
+        new_content, count, broken_links = replace_in_markdown(
             content, abs_md, root_dir, mapping, markdown_paths, attachment_paths
         )
+
+        for link in broken_links:
+            invalid_references.append({"file": rel_md, "link": link})
 
         if count == 0:
             continue
@@ -506,7 +553,7 @@ def process_markdown_files(root_dir: str, index: Dict[str, List[str]], mapping: 
             f.write(new_content)
 
     logging.info(f"Markdown 修复完成：修改 {total_files} 个文件，共 {total_replacements} 处替换")
-    return total_files, total_replacements, changed_files
+    return total_files, total_replacements, changed_files, invalid_references
 
 
 # ---------- 删除临时文件 ----------
@@ -523,13 +570,13 @@ def safe_delete(path: str):
 # ---------- 主程序 ----------
 
 def run_pipeline(root_dir: str, rename_categories: Optional[List[str]], verbose=False, extra_handlers=None, data_dir: Optional[str] = None):
-    root_dir = os.path.abspath(root_dir)
-    allowed_exts, allow_other, allow_all, category_label = resolve_allowed_extensions(rename_categories)
+    root_dir = normalize_display_path(os.path.abspath(root_dir))
+    allowed_exts, allow_all, normalized_types, category_label = resolve_allowed_extensions(rename_categories)
 
     setup_logger(verbose, extra_handlers)
 
     logging.info("====================================")
-    logging.info(" Markdown 附件重命名 & 路径修复工具 ")
+    logging.info(" Markdown路径修复工具 ")
     logging.info(f" 工作根目录：{root_dir}")
     logging.info(f" 重命名分类：{category_label}")
     logging.info("====================================")
@@ -538,13 +585,13 @@ def run_pipeline(root_dir: str, rename_categories: Optional[List[str]], verbose=
 
     self_exec = sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__)
 
-    mapping, detected, renamed, rename_details = rename_attachments(root_dir, self_exec, allowed_exts, allow_other, allow_all)
+    mapping, detected, renamed, rename_details = rename_attachments(root_dir, self_exec, allowed_exts, allow_all)
     mapping_path = save_mapping(root_dir, mapping, data_dir)
 
     index = build_file_index(root_dir)
     index_path = save_index(root_dir, index, data_dir)
 
-    md_files, replacements, changed_files = process_markdown_files(root_dir, index, mapping)
+    md_files, replacements, changed_files, invalid_refs = process_markdown_files(root_dir, index, mapping)
     duplicates, duplicate_table, duplicate_list = detect_duplicate_filenames(index)
 
     safe_delete(mapping_path)
@@ -556,6 +603,7 @@ def run_pipeline(root_dir: str, rename_categories: Optional[List[str]], verbose=
     logging.info("------ 运行结果 ------")
     logging.info(f"重命名候选：{detected} | 实际重命名：{renamed}")
     logging.info(f"Markdown 修复：{md_files} | 替换次数：{replacements}")
+    logging.info(f"失效引用：{len(invalid_refs)}")
 
     summary = {
         "root": root_dir,
@@ -564,11 +612,14 @@ def run_pipeline(root_dir: str, rename_categories: Optional[List[str]], verbose=
         "markdown_fixed": md_files,
         "replacements": replacements,
         "rename_categories": category_label,
+        "rename_category_keys": normalized_types,
         "duplicates": duplicates,
         "duplicate_table": duplicate_table,
         "rename_details": rename_details,
         "fixed_files": changed_files,
         "duplicate_list": duplicate_list,
+        "invalid_references": invalid_refs,
+        "invalid_reference_count": len(invalid_refs),
     }
 
     if data_dir:
@@ -579,13 +630,13 @@ def run_pipeline(root_dir: str, rename_categories: Optional[List[str]], verbose=
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Markdown 附件重命名 & 路径修复工具")
+    parser = argparse.ArgumentParser(description="Markdown路径修复工具")
     parser.add_argument("--root", help="指定工作根目录（默认使用脚本所在目录）")
     parser.add_argument(
         "--rename-types",
         nargs="+",
         default=[DEFAULT_RENAME_CATEGORY],
-        help="重命名分类列表，可选 image video audio office other 或 all",
+        help="重命名分类列表，可选 image video audio office 或 all",
     )
     parser.add_argument("--data-dir", help="固化数据存储目录（可选）")
     parser.add_argument("--ui", action="store_true", help="启动图形界面")
@@ -611,12 +662,22 @@ def main_cli(args):
 def launch_ui(default_root: Optional[str] = None):
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
-    PROJECT_CATEGORIES = list(RENAMING_CATEGORIES.keys()) + ["other"]
+    PROJECT_CATEGORIES = list(RENAMING_CATEGORIES.keys())
     CATEGORY_CHOICES = [(c, CATEGORY_LABELS[c]) for c in PROJECT_CATEGORIES] + [("all", CATEGORY_LABELS["all"])]
+    if os.name == "nt":
+        try:
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            pass
     projects, settings = load_projects_config()
     app = tk.Tk()
-    app.title("Markdown 附件重命名 & 路径修复工具")
+    app.title("Markdown路径修复工具")
     app.configure(bg="#f4f5f7")
+    try:
+        app.tk.call("tk", "scaling", 1.4)
+    except Exception:
+        pass
     try:
         app.iconbitmap(LOGO_PATH)
     except Exception:
@@ -624,7 +685,7 @@ def launch_ui(default_root: Optional[str] = None):
     try:
         import tkinter.font as tkfont
         default_font = tkfont.nametofont("TkDefaultFont")
-        default_font.configure(family="Segoe UI", size=10)
+        default_font.configure(family="Segoe UI", size=13)
     except Exception:
         pass
 
@@ -633,21 +694,22 @@ def launch_ui(default_root: Optional[str] = None):
         style.theme_use("clam")
     except Exception:
         pass
-    style.configure("Accent.TButton", padding=(12, 8), foreground="#ffffff", background="#3b82f6", borderwidth=0)
+    style.configure("Accent.TButton", padding=(14, 10), foreground="#ffffff", background="#3b82f6", borderwidth=0)
     style.map("Accent.TButton", background=[("active", "#2563eb")])
     style.configure("Card.TFrame", background="#ffffff", relief="flat")
-    style.configure("Icon.TButton", padding=6, foreground="#1f2937", background="#e5edff", borderwidth=0)
+    style.configure("Icon.TButton", padding=10, foreground="#1f2937", background="#e5edff", borderwidth=0)
     style.map("Icon.TButton", background=[("active", "#d8e3ff")])
-    style.configure("TButton", padding=(10, 6), background="#ffffff", foreground="#1f2937")
+    style.configure("TButton", padding=(14, 10), background="#ffffff", foreground="#1f2937")
     style.configure("Custom.TFrame", background="#f4f5f7")
     style.configure("TLabel", background="#f4f5f7", foreground="#1f2937")
     style.configure("TLabelframe", background="#f4f5f7", foreground="#1f2937")
-    style.configure("TEntry", fieldbackground="#ffffff", foreground="#1f2937")
-    style.configure("TCombobox", fieldbackground="#ffffff", foreground="#1f2937")
-    style.configure("Treeview", background="#ffffff", foreground="#1f2937", fieldbackground="#ffffff", bordercolor="#d7dce4")
+    style.configure("TEntry", fieldbackground="#ffffff", foreground="#1f2937", padding=6)
+    style.configure("TCombobox", fieldbackground="#ffffff", foreground="#1f2937", padding=6)
+    style.configure("Treeview", background="#ffffff", foreground="#1f2937", fieldbackground="#ffffff", bordercolor="#d7dce4", borderwidth=1, relief="solid")
+    style.configure("Treeview", rowheight=28)
     style.configure("Treeview.Heading", background="#e8edf5", foreground="#1f2937")
     style.configure("TNotebook", background="#f4f5f7")
-    style.configure("TNotebook.Tab", padding=(10, 6))
+    style.configure("TNotebook.Tab", padding=(12, 8))
 
     colors = {
         "bg": "#f4f5f7",
@@ -669,6 +731,29 @@ def launch_ui(default_root: Optional[str] = None):
         "settings": "⚙",
         "add": "＋",
     }
+
+    def create_round_button(parent, text, command, width=170):
+        height = 42
+        radius = 10
+        canvas = tk.Canvas(parent, width=width, height=height, bg=colors["selected"], highlightthickness=0, bd=0)
+
+        def draw(color):
+            canvas.delete("btn")
+            r = radius
+            canvas.create_rectangle(r, 0, width - r, height, fill=color, outline=color, tags="btn")
+            canvas.create_rectangle(0, r, width, height - r, fill=color, outline=color, tags="btn")
+            canvas.create_arc(0, 0, 2 * r, 2 * r, start=90, extent=90, fill=color, outline=color, tags="btn")
+            canvas.create_arc(width - 2 * r, 0, width, 2 * r, start=0, extent=90, fill=color, outline=color, tags="btn")
+            canvas.create_arc(0, height - 2 * r, 2 * r, height, start=180, extent=90, fill=color, outline=color, tags="btn")
+            canvas.create_arc(width - 2 * r, height - 2 * r, width, height, start=270, extent=90, fill=color, outline=color, tags="btn")
+            canvas.create_text(width / 2, height / 2, text=text, fill="#ffffff", font=("Segoe UI", 12, "bold"), tags="btn")
+
+        draw(colors["accent"])
+        canvas.configure(cursor="hand2")
+        canvas.bind("<Button-1>", lambda e: command())
+        canvas.bind("<Enter>", lambda e: draw("#2563eb"))
+        canvas.bind("<Leave>", lambda e: draw(colors["accent"]))
+        return canvas
 
     log_view = {"widget": None}
     log_buffer: List[str] = []
@@ -706,27 +791,6 @@ def launch_ui(default_root: Optional[str] = None):
         def emit(self, record):
             msg = self.format(record)
             append_log(msg)
-
-    def normalize_categories(selected_types: Optional[List[str]]):
-        if not selected_types:
-            return [DEFAULT_RENAME_CATEGORY]
-        if "all" in selected_types:
-            return ["all"]
-        ordered = [t for t in CATEGORY_ORDER if t in selected_types]
-        extras = [t for t in selected_types if t not in ordered and t in {"other"}]
-        normalized = ordered + extras
-        return normalized or [DEFAULT_RENAME_CATEGORY]
-
-    def category_labels(rename_types: Optional[List[str]]):
-        if not rename_types:
-            return [CATEGORY_LABELS[DEFAULT_RENAME_CATEGORY]]
-        if "all" in rename_types:
-            return [CATEGORY_LABELS["all"]]
-        labels = [CATEGORY_LABELS[t] for t in CATEGORY_ORDER if t in rename_types]
-        return labels or [CATEGORY_LABELS[DEFAULT_RENAME_CATEGORY]]
-
-    def category_label_from_types(rename_types: Optional[List[str]]):
-        return "、".join(category_labels(rename_types))
 
     class MultiSelectDropdown(ttk.Menubutton):
         def __init__(self, parent, options, initial_keys=None, command=None, **kwargs):
@@ -805,6 +869,18 @@ def launch_ui(default_root: Optional[str] = None):
         state["selected"] = len(state["projects"]) - 1
         persist_projects()
 
+    def attach_dir_picker(entry: ttk.Entry, var: tk.StringVar, initial_dir_getter):
+        def pick(event=None):
+            current = var.get().strip()
+            initial_dir = initial_dir_getter() or current or get_app_root()
+            chosen = filedialog.askdirectory(initialdir=initial_dir) or current
+            if chosen:
+                var.set(chosen)
+        entry.bind("<Button-1>", pick)
+        entry.bind("<Return>", pick)
+        entry.bind("<KP_Enter>", pick)
+        entry.configure(cursor="hand2", state="readonly")
+
     # ---------- Onboarding ----------
     def show_onboarding():
         for child in app.winfo_children():
@@ -818,14 +894,16 @@ def launch_ui(default_root: Optional[str] = None):
         root_path = tk.StringVar(value=default_root or get_app_root())
         name_var = tk.StringVar(value="")
 
-        ttk.Label(frame, text="首次使用 - 系统设置与项目", font=("Segoe UI", 12, "bold")).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
+        ttk.Label(frame, text="首次使用 - 系统设置与项目", font=("Segoe UI", 14, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
         ttk.Label(frame, text="数据存储位置（系统设置，必填）：").grid(row=1, column=0, sticky="w", pady=(8, 2))
-        ttk.Entry(frame, textvariable=data_path, width=60).grid(row=1, column=1, sticky="we", padx=(4, 4))
-        ttk.Button(frame, text="...", width=3, command=lambda: data_path.set(filedialog.askdirectory(initialdir=data_path.get() or get_app_root()) or data_path.get())).grid(row=1, column=2, sticky="e")
+        data_entry = ttk.Entry(frame, textvariable=data_path, width=60)
+        data_entry.grid(row=1, column=1, sticky="we", padx=(4, 4))
+        attach_dir_picker(data_entry, data_path, lambda: data_path.get())
 
         ttk.Label(frame, text="文档项目位置（必填）：").grid(row=2, column=0, sticky="w", pady=(8, 2))
-        ttk.Entry(frame, textvariable=root_path, width=60).grid(row=2, column=1, sticky="we", padx=(4, 4))
-        ttk.Button(frame, text="...", width=3, command=lambda: root_path.set(filedialog.askdirectory(initialdir=root_path.get() or get_app_root()) or root_path.get())).grid(row=2, column=2, sticky="e")
+        root_entry = ttk.Entry(frame, textvariable=root_path, width=60)
+        root_entry.grid(row=2, column=1, sticky="we", padx=(4, 4))
+        attach_dir_picker(root_entry, root_path, lambda: root_path.get() or get_app_root())
 
         ttk.Label(frame, text="自定义名称（可选）：").grid(row=3, column=0, sticky="w", pady=(8, 2))
         ttk.Entry(frame, textvariable=name_var, width=60).grid(row=3, column=1, sticky="we", padx=(4, 4))
@@ -841,7 +919,7 @@ def launch_ui(default_root: Optional[str] = None):
             add_project(root_val, name_var.get())
             build_main_ui()
 
-        ttk.Button(frame, text="提交并进入", command=submit).grid(row=4, column=0, columnspan=3, pady=(12, 0))
+        ttk.Button(frame, text="提交并进入", command=submit).grid(row=4, column=0, columnspan=2, pady=(12, 0))
         frame.columnconfigure(1, weight=1)
 
     # ---------- Main UI ----------
@@ -861,8 +939,8 @@ def launch_ui(default_root: Optional[str] = None):
         header = tk.Frame(
             wrapper,
             bg=colors["selected"],
-            padx=12,
-            pady=10,
+            padx=14,
+            pady=12,
             highlightthickness=1,
             highlightbackground=colors["border"],
             highlightcolor=colors["border"],
@@ -870,7 +948,7 @@ def launch_ui(default_root: Optional[str] = None):
         header.grid(row=0, column=0, columnspan=2, sticky="we")
         if logo_img:
             tk.Label(header, image=logo_img, bg=colors["selected"]).pack(side="left")
-        tk.Label(header, text="文档项目管理", bg=colors["selected"], fg=colors["text"], font=("Segoe UI", 14, "bold")).pack(side="left", padx=(8, 0))
+        tk.Label(header, text="文档项目管理", bg=colors["selected"], fg=colors["text"], font=("Segoe UI", 16, "bold")).pack(side="left", padx=(8, 0))
 
         content = tk.Frame(wrapper, bg=colors["bg"])
         content.grid(row=1, column=0, sticky="nsew")
@@ -880,11 +958,11 @@ def launch_ui(default_root: Optional[str] = None):
         content.rowconfigure(0, weight=1)
 
         # Project list
-        left = tk.Frame(content, bg=colors["bg"], padx=8, pady=6)
+        left = tk.Frame(content, bg=colors["bg"], padx=12, pady=10)
         left.grid(row=0, column=0, sticky="nswe")
-        tk.Label(left, text="项目文档列表", bg=colors["bg"], fg=colors["text"], font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 6))
+        tk.Label(left, text="项目文档列表", bg=colors["bg"], fg=colors["text"], font=("Segoe UI", 13, "bold")).pack(anchor="w", pady=(0, 6))
 
-        canvas = tk.Canvas(left, bg=colors["bg"], highlightthickness=0, height=360)
+        canvas = tk.Canvas(left, bg=colors["bg"], highlightthickness=0, height=420)
         scrollbar = ttk.Scrollbar(left, orient="vertical", command=canvas.yview)
         list_frame = tk.Frame(canvas, bg=colors["bg"])
         list_window = canvas.create_window((0, 0), window=list_frame, anchor="nw")
@@ -898,7 +976,7 @@ def launch_ui(default_root: Optional[str] = None):
         canvas.bind("<Configure>", lambda e: canvas.itemconfigure(list_window, width=e.width))
 
         # Detail + log
-        right = tk.Frame(content, bg=colors["bg"], padx=10, pady=6)
+        right = tk.Frame(content, bg=colors["bg"], padx=14, pady=10)
         right.grid(row=0, column=1, sticky="nsew")
         right.columnconfigure(1, weight=1)
 
@@ -970,12 +1048,9 @@ def launch_ui(default_root: Optional[str] = None):
             data_var = tk.StringVar(value=state["settings"].get("data_dir", ""))
 
             ttk.Label(dialog, text="数据存储位置：").grid(row=0, column=0, sticky="w", pady=(8, 2))
-            ttk.Entry(dialog, textvariable=data_var, width=50).grid(row=0, column=1, sticky="we", padx=(4, 4))
-
-            def choose_dir():
-                chosen = filedialog.askdirectory(initialdir=data_var.get() or get_app_root()) or data_var.get()
-                if chosen:
-                    data_var.set(chosen)
+            data_entry = ttk.Entry(dialog, textvariable=data_var, width=50)
+            data_entry.grid(row=0, column=1, sticky="we", padx=(4, 4))
+            attach_dir_picker(data_entry, data_var, lambda: data_var.get())
 
             def save_settings():
                 new_dir = data_var.get().strip()
@@ -993,9 +1068,8 @@ def launch_ui(default_root: Optional[str] = None):
                 persist_projects()
                 dialog.destroy()
 
-            ttk.Button(dialog, text="...", width=3, command=choose_dir).grid(row=0, column=2, sticky="e")
             btns = ttk.Frame(dialog)
-            btns.grid(row=1, column=0, columnspan=3, sticky="e", pady=(10, 4))
+            btns.grid(row=1, column=0, columnspan=2, sticky="e", pady=(10, 4))
             ttk.Button(btns, text="保存", command=save_settings).pack(side="left", padx=4)
             ttk.Button(btns, text="关闭", command=dialog.destroy).pack(side="left", padx=4)
             dialog.columnconfigure(1, weight=1)
@@ -1010,8 +1084,9 @@ def launch_ui(default_root: Optional[str] = None):
             root_var = tk.StringVar(value=get_app_root())
 
             ttk.Label(dialog, text="文档项目位置：").grid(row=0, column=0, sticky="w", pady=(8, 2))
-            ttk.Entry(dialog, textvariable=root_var, width=50).grid(row=0, column=1, sticky="we", padx=(4, 4))
-            ttk.Button(dialog, text="...", width=3, command=lambda: root_var.set(filedialog.askdirectory(initialdir=root_var.get() or get_app_root()) or root_var.get())).grid(row=0, column=2, sticky="e")
+            root_entry = ttk.Entry(dialog, textvariable=root_var, width=50)
+            root_entry.grid(row=0, column=1, sticky="we", padx=(4, 4))
+            attach_dir_picker(root_entry, root_var, lambda: root_var.get() or get_app_root())
 
             ttk.Label(dialog, text="自定义名称（可选）：").grid(row=1, column=0, sticky="w", pady=(8, 2))
             ttk.Entry(dialog, textvariable=name_var, width=50).grid(row=1, column=1, sticky="we", padx=(4, 4))
@@ -1032,14 +1107,16 @@ def launch_ui(default_root: Optional[str] = None):
                 dialog.destroy()
 
             btns = ttk.Frame(dialog)
-            btns.grid(row=2, column=0, columnspan=3, sticky="e", pady=(10, 4))
+            btns.grid(row=2, column=0, columnspan=2, sticky="e", pady=(10, 4))
             ttk.Button(btns, text="保存", command=submit_new).pack(side="left", padx=4)
             ttk.Button(btns, text="取消", command=dialog.destroy).pack(side="left", padx=4)
             dialog.columnconfigure(1, weight=1)
             center_window(dialog)
 
-        ttk.Button(header, text=f"{icons['settings']} 系统设置", style="Accent.TButton", command=show_settings).pack(side="right")
-        ttk.Button(header, text=f"{icons['add']} 新增项目", style="Accent.TButton", command=show_add_project).pack(side="right", padx=(0, 6))
+        settings_btn = create_round_button(header, f"{icons['settings']} 系统设置", show_settings, width=150)
+        settings_btn.pack(side="right")
+        add_btn = create_round_button(header, f"{icons['add']} 新增项目", show_add_project, width=150)
+        add_btn.pack(side="right", padx=(0, 8))
 
         def select_project(idx: int):
             state["selected"] = idx
@@ -1080,7 +1157,8 @@ def launch_ui(default_root: Optional[str] = None):
                     state["summary"] = summary
                     msg = (
                         f"重命名 {summary['renamed_files']}/{summary['rename_candidates']}；"
-                        f"Markdown 修复 {summary['markdown_fixed']}，替换 {summary['replacements']} 处。"
+                        f"Markdown 修复 {summary['markdown_fixed']}，替换 {summary['replacements']} 处；"
+                        f"失效引用 {summary.get('invalid_reference_count', 0)} 条。"
                     )
                     app.after(0, lambda: (status_var.set("完成"), render_summary(summary)))
                     app.after(0, lambda: messagebox.showinfo("完成", msg))
@@ -1162,20 +1240,20 @@ def launch_ui(default_root: Optional[str] = None):
                     highlightthickness=1,
                     highlightbackground=colors["border"],
                     highlightcolor=colors["border"],
-                    padx=10,
-                    pady=6,
+                    padx=14,
+                    pady=10,
                 )
                 card.pack(fill="x", pady=4)
 
                 top_row = tk.Frame(card, bg=missing_bg)
                 top_row.pack(fill="x")
                 name = proj.get("name") or Path(proj.get("root", "")).name
-                tk.Label(top_row, text=name, bg=missing_bg, fg=colors["text"], font=("Segoe UI", 10, "bold")).pack(side="left")
+                tk.Label(top_row, text=name, bg=missing_bg, fg=colors["text"], font=("Segoe UI", 12, "bold")).pack(side="left")
                 status_txt = "路径缺失" if not exists else "正常"
                 status_fg = "#c53030" if not exists else colors["muted"]
-                tk.Label(top_row, text=status_txt, bg=missing_bg, fg=status_fg, font=("Segoe UI", 9)).pack(side="right")
+                tk.Label(top_row, text=status_txt, bg=missing_bg, fg=status_fg, font=("Segoe UI", 11)).pack(side="right")
 
-                root_display = proj.get("root", "")
+                root_display = normalize_display_path(proj.get("root", ""))
                 path_row = tk.Frame(card, bg=missing_bg)
                 path_row.pack(fill="x")
                 tk.Label(path_row, text="位置：", bg=missing_bg, fg=colors["muted"]).pack(side="left")
@@ -1186,7 +1264,7 @@ def launch_ui(default_root: Optional[str] = None):
                     fg=colors["accent"],
                     anchor="w",
                     cursor="hand2",
-                    wraplength=420,
+                    wraplength=520,
                     justify="left",
                 )
                 link_root.pack(side="left", fill="x", expand=True)
@@ -1195,42 +1273,43 @@ def launch_ui(default_root: Optional[str] = None):
                 tk.Label(card, text=f"分类: {category_label}", bg=missing_bg, fg=colors["muted"], anchor="w").pack(fill="x")
 
                 actions = tk.Frame(card, bg=missing_bg)
-                view_btn = ttk.Button(actions, text=icons["info"], style="Icon.TButton", command=lambda idx=i: show_details(idx))
-                run_btn = ttk.Button(actions, text=icons["run"], style="Icon.TButton", command=lambda idx=i: run_project(idx))
-                open_btn = ttk.Button(actions, text=icons["open"], style="Icon.TButton", command=lambda p=proj.get("root", ""): open_path(p))
-                delete_btn = ttk.Button(actions, text=icons["delete"], style="Icon.TButton", command=lambda idx=i: remove_project(idx))
-                view_btn.pack(side="left", padx=2)
-                run_btn.pack(side="left", padx=2)
-                open_btn.pack(side="left", padx=2)
-                delete_btn.pack(side="left", padx=2)
-                actions.pack(side="right", anchor="e", pady=(4, 0))
-                actions.pack_forget()
+                buttons_row = tk.Frame(actions, bg=missing_bg)
+                view_btn = ttk.Button(buttons_row, text=f"{icons['info']} 查看", style="Icon.TButton", command=lambda idx=i: show_details(idx))
+                run_btn = ttk.Button(buttons_row, text=f"{icons['run']} 运行", style="Icon.TButton", command=lambda idx=i: run_project(idx))
+                open_btn = ttk.Button(buttons_row, text=f"{icons['open']} 打开", style="Icon.TButton", command=lambda p=proj.get("root", ""): open_path(p))
+                delete_btn = ttk.Button(buttons_row, text=f"{icons['delete']} 删除", style="Icon.TButton", command=lambda idx=i: remove_project(idx))
+                view_btn.pack(side="left", padx=4)
+                run_btn.pack(side="left", padx=4)
+                open_btn.pack(side="left", padx=4)
+                delete_btn.pack(side="left", padx=4)
+                buttons_row.pack(side="right")
+                actions.pack(fill="x", pady=(10, 0))
 
-                def on_enter(e, c=card, a=actions):
+                def on_enter(e, c=card, a=actions, row=buttons_row):
                     c.configure(bg=colors["hover"])
                     for child in c.winfo_children():
                         child.configure(bg=colors["hover"])
-                    a.pack(side="right", anchor="e", pady=(4, 0))
+                    a.configure(bg=colors["hover"])
+                    row.configure(bg=colors["hover"])
 
-                def on_leave(e, c=card, a=actions, sel=is_selected, miss=not exists):
+                def on_leave(e, c=card, a=actions, sel=is_selected, miss=not exists, row=buttons_row):
                     bg_color = colors["selected"] if sel else (colors["danger"] if miss else colors["card"])
                     c.configure(bg=bg_color)
                     for child in c.winfo_children():
                         child.configure(bg=bg_color)
-                    if not sel:
-                        a.pack_forget()
+                    a.configure(bg=bg_color)
+                    row.configure(bg=bg_color)
 
                 card.bind("<Enter>", on_enter)
                 card.bind("<Leave>", on_leave)
                 card.bind("<Button-1>", lambda e, idx=i: select_project(idx), add="+")
                 for child in card.winfo_children():
                     child.bind("<Button-1>", lambda e, idx=i: select_project(idx), add="+")
-
                 if is_selected:
-                    actions.pack(side="right", anchor="e", pady=(4, 0))
+                    on_enter(None, card, actions, buttons_row)
 
         # Detail form
-        tk.Label(right, text="项目详情", bg=colors["bg"], fg=colors["text"], font=("Segoe UI", 11, "bold")).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
+        tk.Label(right, text="项目详情", bg=colors["bg"], fg=colors["text"], font=("Segoe UI", 14, "bold")).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
         ttk.Label(right, text="名称：").grid(row=1, column=0, sticky="w", pady=(6, 2))
         ttk.Label(right, textvariable=project_name).grid(row=1, column=1, columnspan=2, sticky="w", padx=(4, 4))
 
@@ -1261,8 +1340,32 @@ def launch_ui(default_root: Optional[str] = None):
         notebook.add(summary_tab, text="运行摘要")
         notebook.add(log_tab, text="运行日志")
 
-        summary_frame = tk.Frame(summary_tab, bg=colors["bg"])
-        summary_frame.pack(fill="both", expand=True)
+        summary_container = tk.Frame(summary_tab, bg=colors["bg"])
+        summary_container.pack(fill="both", expand=True)
+        summary_canvas = tk.Canvas(summary_container, bg=colors["bg"], highlightthickness=0)
+        summary_scroll = ttk.Scrollbar(summary_container, orient="vertical", command=summary_canvas.yview)
+        summary_canvas.configure(yscrollcommand=summary_scroll.set)
+        summary_canvas.pack(side="left", fill="both", expand=True)
+        summary_scroll.pack(side="right", fill="y")
+        summary_frame = tk.Frame(summary_canvas, bg=colors["bg"])
+        summary_window = summary_canvas.create_window((0, 0), window=summary_frame, anchor="nw")
+
+        def _update_summary_scroll(event=None):
+            summary_canvas.configure(scrollregion=summary_canvas.bbox("all"))
+        summary_frame.bind("<Configure>", _update_summary_scroll)
+        summary_canvas.bind("<Configure>", lambda e: summary_canvas.itemconfigure(summary_window, width=e.width))
+
+        def _on_summary_wheel(event):
+            summary_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        def _bind_summary_wheel(event=None):
+            summary_canvas.bind_all("<MouseWheel>", _on_summary_wheel)
+
+        def _unbind_summary_wheel(event=None):
+            summary_canvas.unbind_all("<MouseWheel>")
+
+        summary_canvas.bind("<Enter>", _bind_summary_wheel)
+        summary_canvas.bind("<Leave>", _unbind_summary_wheel)
 
         log_text = tk.Text(
             log_tab,
@@ -1289,20 +1392,24 @@ def launch_ui(default_root: Optional[str] = None):
 
         def render_table(parent, title: str, columns, rows):
             section = tk.Frame(parent, bg=colors["bg"], pady=4)
-            section.pack(fill="x", expand=True, pady=4)
-            tk.Label(section, text=title, bg=colors["bg"], fg=colors["text"], font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(0, 2))
+            section.pack(fill="both", expand=True, pady=6)
+            tk.Label(section, text=title, bg=colors["bg"], fg=colors["text"], font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(0, 2))
             col_ids = [f"c{i}" for i in range(len(columns))]
-            tree = ttk.Treeview(section, columns=col_ids, show="headings", height=max(3, min(8, len(rows) + 1)))
+            tree_height = max(6, min(16, len(rows) + 4))
+            tree = ttk.Treeview(section, columns=col_ids, show="headings", height=tree_height)
             for col_id, (title_txt, width) in zip(col_ids, columns):
                 tree.heading(col_id, text=title_txt)
-                tree.column(col_id, width=width, anchor="w")
+                tree.column(col_id, width=width, anchor="w", stretch=True)
             display_rows = rows or [["暂无数据"] + [""] * (len(columns) - 1)]
-            for row in display_rows:
-                tree.insert("", "end", values=row)
+            tree.tag_configure("odd", background="#f7f9fc")
+            tree.tag_configure("even", background="#ffffff")
+            for idx, row in enumerate(display_rows):
+                tag = "odd" if idx % 2 == 0 else "even"
+                tree.insert("", "end", values=row, tags=(tag,))
             vsb = ttk.Scrollbar(section, orient="vertical", command=tree.yview)
             tree.configure(yscrollcommand=vsb.set)
-            tree.pack(side="left", fill="both", expand=True)
-            vsb.pack(side="right", fill="y")
+            tree.pack(side="left", fill="both", expand=True, padx=(0, 4))
+            vsb.pack(side="right", fill="y", padx=(0, 2))
 
         def render_summary(summary: Optional[Dict]):
             for child in summary_frame.winfo_children():
@@ -1312,39 +1419,50 @@ def launch_ui(default_root: Optional[str] = None):
                 return
 
             meta = tk.Frame(summary_frame, bg=colors["bg"])
-            meta.pack(fill="x", padx=4, pady=(4, 2))
-            meta_items = [
-                f"工作目录：{summary.get('root', '')}",
-                f"重命名分类：{summary.get('rename_categories', '')}",
-                f"重命名 {summary.get('renamed_files', 0)}/{summary.get('rename_candidates', 0)}",
-                f"Markdown 修复 {summary.get('markdown_fixed', 0)}，替换 {summary.get('replacements', 0)} 处",
-            ]
-            for item in meta_items:
-                tk.Label(meta, text=item, bg=colors["bg"], fg=colors["text"]).pack(anchor="w")
+            meta.pack(fill="x", padx=8, pady=(4, 6))
+            category_display = category_label_from_types(summary.get("rename_category_keys")) or summary.get("rename_categories", "")
+
+            def add_meta_row(label_text: str, value_text: str):
+                row = tk.Frame(meta, bg=colors["bg"])
+                row.pack(anchor="w", pady=1)
+                tk.Label(row, text=f"{label_text}：", bg=colors["bg"], fg=colors["accent"], font=("Segoe UI", 11, "bold")).pack(side="left")
+                tk.Label(row, text=value_text, bg=colors["bg"], fg=colors["text"]).pack(side="left")
+
+            add_meta_row("工作目录", normalize_display_path(summary.get("root", "")))
+            add_meta_row("重命名分类", category_display)
+            add_meta_row("重命名", f"{summary.get('renamed_files', 0)}/{summary.get('rename_candidates', 0)}")
+            add_meta_row("Markdown 修复", f"{summary.get('markdown_fixed', 0)}，替换 {summary.get('replacements', 0)} 处")
+            add_meta_row("失效引用", str(summary.get('invalid_reference_count', 0)))
 
             rename_rows = [
-                ("重命名", item["old"], item["new"], item.get("path", ""))
+                ("重命名", item["old"], item["new"], normalize_display_path(item.get("path", "")))
                 for item in summary.get("rename_details", [])
             ]
             fixed_rows = [
-                ("修正信息", os.path.basename(p), p)
+                ("修正信息", os.path.basename(p), normalize_display_path(p))
                 for p in summary.get("fixed_files", [])
             ]
             dup_rows = [
-                ("重名文件", item["name"], item["path"])
+                ("重名文件", item["name"], normalize_display_path(item["path"]))
                 for item in summary.get("duplicate_list", [])
+            ]
+            invalid_rows = [
+                ("失效引用", normalize_display_path(item.get("file", "")), item.get("link", ""))
+                for item in summary.get("invalid_references", [])
             ]
             stats_rows = [(
                 "统计信息",
                 summary.get("renamed_files", 0),
                 summary.get("markdown_fixed", 0),
                 len(summary.get("duplicate_list", [])),
+                summary.get("invalid_reference_count", 0),
             )]
 
-            render_table(summary_frame, "重命名表格", [("信息类型", 80), ("修改前", 180), ("修改后", 200), ("路径", 220)], rename_rows)
-            render_table(summary_frame, "修正表格", [("信息类型", 80), ("文件", 200), ("路径", 260)], fixed_rows)
-            render_table(summary_frame, "重名文件表格", [("信息类型", 80), ("文件", 200), ("路径", 260)], dup_rows)
-            render_table(summary_frame, "统计表格", [("信息类型", 100), ("重命名数量", 120), ("修正文件数量", 140), ("重名文件数量", 140)], stats_rows)
+            render_table(summary_frame, "重命名表格", [("信息类型", 100), ("修改前", 220), ("修改后", 240), ("路径", 260)], rename_rows)
+            render_table(summary_frame, "修正表格", [("信息类型", 100), ("文件", 240), ("路径", 340)], fixed_rows)
+            render_table(summary_frame, "重名文件表格", [("信息类型", 100), ("文件", 240), ("路径", 340)], dup_rows)
+            render_table(summary_frame, "失效引用", [("信息类型", 100), ("Markdown 文件", 260), ("引用路径", 340)], invalid_rows)
+            render_table(summary_frame, "统计表格", [("信息类型", 110), ("重命名数量", 140), ("修正文件数量", 160), ("重名文件数量", 160), ("失效引用数量", 160)], stats_rows)
 
         # Populate fields and list
         set_fields_from_project(state["selected"])

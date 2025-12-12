@@ -1,6 +1,6 @@
 # md_link_fixer  
 ### Markdown Attachment Renamer & Link Auto-Fixer  
-### Markdown 附件重命名 & 路径自动修复工具
+### Markdown路径修复工具
 
 ---
 
