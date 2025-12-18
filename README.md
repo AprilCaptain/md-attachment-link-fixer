@@ -73,7 +73,7 @@ python md_link_fixer.py --data-dir D:\data\md-fixer   # 固化数据输出目录
 
 # 启动界面模式
 python md_link_fixer.py --ui
-# UI 首次运行会要求填写文档项目路径与数据存放路径，并可为项目设置名称和分类。
+# UI 首次运行会进入引导界面：默认数据目录为应用目录下的 .data，并引导创建项目（名称/根目录/分类）。
 ```
 
 ### 3. 等待完成  
